@@ -55,6 +55,25 @@ String ipAddress = "";
 unsigned long lastIPDisplayTime = 0;
 const unsigned long IP_DISPLAY_INTERVAL = 30000; // 每30秒显示一次IP地址
 
+// 树莓派通信相关变量
+#define RX_PIN 16     // 用于接收树莓派数据的接收引脚
+#define TX_PIN 17     // 用于向树莓派发送数据的发送引脚
+#define RPI_SERIAL Serial2  // 使用ESP32的第二个硬件串口
+
+// 垃圾类型定义
+#define WASTE_TYPE_HARMFUL   0  // 有害垃圾 (00,h)
+#define WASTE_TYPE_KITCHEN   1  // 厨余垃圾 (01,k)
+#define WASTE_TYPE_OTHER     2  // 其它垃圾 (10,o)
+#define WASTE_TYPE_RECYCLING 3  // 可回收垃圾 (11,r)
+
+// 垃圾类型状态变量
+int currentWasteType = -1;  // -1表示未检测到垃圾类型
+String wasteTypeStr = "未识别";  // 存储垃圾类型的字符串
+
+// 其他变量
+unsigned long lastTrashDataTime = 0;
+const unsigned long TRASH_DATA_INTERVAL = 2000; // 数据上报间隔(毫秒)
+
 void MQTT_Init()
 {
 //WiFi网络连接部分
@@ -111,6 +130,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       <p>光线值: <span class="data" id="lightValue">%LIGHT%</span></p>
       <p>火焰状态: <span class="data" id="fireStatus">%FIRE%</span></p>
       <p>垃圾桶状态: <span class="data" id="binStatus">%BIN%</span></p>
+      <p>垃圾类型: <span class="data" id="wasteType">%WASTE%</span></p>
     </div>
     
     <div class="card">
@@ -133,6 +153,7 @@ const char index_html[] PROGMEM = R"rawliteral(
           document.getElementById("lightValue").innerText = data.light;
           document.getElementById("fireStatus").innerText = data.fire;
           document.getElementById("binStatus").innerText = data.bin;
+          document.getElementById("wasteType").innerText = data.waste;
         }
       };
       xhr.open("GET", "/data", true);
@@ -155,6 +176,7 @@ void handleRoot() {
   html.replace("%LIGHT%", lightValueStr);
   html.replace("%FIRE%", fireStatusStr);
   html.replace("%BIN%", binStatusStr);
+  html.replace("%WASTE%", wasteTypeStr);
   server.send(200, "text/html", html);
 }
 
@@ -163,7 +185,8 @@ void handleData() {
   String json = "{";
   json += "\"light\":\"" + lightValueStr + "\",";
   json += "\"fire\":\"" + fireStatusStr + "\",";
-  json += "\"bin\":\"" + binStatusStr + "\"";
+  json += "\"bin\":\"" + binStatusStr + "\",";
+  json += "\"waste\":\"" + wasteTypeStr + "\"";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -195,10 +218,58 @@ void handleServo() {
   }
 }
 
+// 新增函数：将垃圾类型数据上报到华为云
+void reportWasteTypeToCloud(int wasteType, String wasteTypeStr) {
+  // 此函数是华为云IoT平台接口
+  StaticJsonBuffer<300> JSONbuffer;
+  JsonObject& root = JSONbuffer.createObject();
+  JsonArray& services = root.createNestedArray("services");
+  JsonObject& service_1 = services.createNestedObject();
+  JsonObject& properties_1_1 = service_1.createNestedObject("properties");
+ 
+  service_1["service_id"] = "A311";
+  properties_1_1["light"] = analogRead(LIGHT_SENSOR_PIN); 
+  properties_1_1["wasteType"] = wasteType; 
+  properties_1_1["wasteTypeStr"] = wasteTypeStr; 
+ 
+  char JSONmessageBuffer[200];
+  root.printTo(JSONmessageBuffer, sizeof(JSONmessageBuffer));
+  
+  Serial.println("Sending waste type data to MQTT topic..");
+  Serial.println(JSONmessageBuffer);
+ 
+  if (client.publish(topic_properties_report, JSONmessageBuffer) == true) {
+    Serial.println("Success sending waste type message");
+  } else {
+    Serial.println("Error sending waste type message");
+  }
+  
+  client.loop();
+}
+
+// 新增函数：获取垃圾类型的字符串描述
+String getWasteTypeString(int type) {
+  switch(type) {
+    case WASTE_TYPE_HARMFUL:
+      return "有害垃圾(H)";
+    case WASTE_TYPE_KITCHEN:
+      return "厨余垃圾(K)";
+    case WASTE_TYPE_OTHER:
+      return "其它垃圾(O)";
+    case WASTE_TYPE_RECYCLING:
+      return "可回收垃圾(R)";
+    default:
+      return "未识别";
+  }
+}
+
 void setup() {
   // 初始化串口通信，用于调试
   Serial.begin(115200);
-
+  
+  // 初始化与树莓派通信的串口
+  RPI_SERIAL.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
+  
   myServo.attach(Serpin);
   myServo.write(90); // 初始位置设为90度
   
@@ -229,6 +300,7 @@ void setup() {
   Serial.println("====================================");
   Serial.println("Web服务器已启动，请访问以下地址：");
   Serial.println("http://" + ipAddress);
+  Serial.println("树莓派通信已初始化，等待接收垃圾分类数据");
   Serial.println("====================================\n");
   
   Serial.println("智能垃圾桶环境光线检测系统初始化完成");
@@ -351,6 +423,54 @@ void loop() {
     Serial.println("无火焰");
     digitalWrite(speakerPin, LOW);
     fireStatusStr = "无火焰";
+  }
+
+  // 读取来自树莓派的数据
+  if (RPI_SERIAL.available() > 0) {
+    String data = RPI_SERIAL.readStringUntil('\n');
+    data.trim(); // 移除空白字符
+    
+    Serial.print("收到树莓派数据：");
+    Serial.println(data);
+    
+    // 解析垃圾类型数据
+    if (data.length() == 2) {
+      // 假设树莓派发送的是两位代码
+      if (data == "00" || data == "h" || data == "H") {
+        currentWasteType = WASTE_TYPE_HARMFUL;
+        // 有害垃圾警报 - 蜂鸣器发出警报声
+        Serial.println("警告：检测到有害垃圾！");
+        for (int i = 0; i < 3; i++) {  // 发出三声短促警报
+          digitalWrite(speakerPin, HIGH);
+          delay(200);
+          digitalWrite(speakerPin, LOW);
+          delay(100);
+        }
+      } else if (data == "01" || data == "k" || data == "K") {
+        currentWasteType = WASTE_TYPE_KITCHEN;
+      } else if (data == "10" || data == "o" || data == "O") {
+        currentWasteType = WASTE_TYPE_OTHER;
+      } else if (data == "11" || data == "r" || data == "R") {
+        currentWasteType = WASTE_TYPE_RECYCLING;
+      } else {
+        currentWasteType = -1; // 未识别的垃圾类型
+      }
+      
+      // 更新垃圾类型字符串
+      wasteTypeStr = getWasteTypeString(currentWasteType);
+      Serial.print("当前垃圾类型: ");
+      Serial.println(wasteTypeStr);
+      
+      // 上报数据到华为云
+      reportWasteTypeToCloud(currentWasteType, wasteTypeStr);
+    }
+  }
+  
+  // 定期更新和上报垃圾类型数据
+  currentMillis = millis();
+  if (currentMillis - lastTrashDataTime >= TRASH_DATA_INTERVAL && currentWasteType != -1) {
+    lastTrashDataTime = currentMillis;
+    reportWasteTypeToCloud(currentWasteType, wasteTypeStr);
   }
 
   // 延时一段时间再进行下一次检测
