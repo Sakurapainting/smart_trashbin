@@ -66,6 +66,13 @@ const unsigned long IP_DISPLAY_INTERVAL = 30000; // 每30秒显示一次IP地址
 #define WASTE_TYPE_OTHER     2  // 其它垃圾 (10,o)
 #define WASTE_TYPE_RECYCLING 3  // 可回收垃圾 (11,r)
 
+// 定义不同垃圾类型对应的舵机角度
+#define SERVO_ANGLE_HARMFUL    30  // 有害垃圾对应的舵机角度
+#define SERVO_ANGLE_KITCHEN    70  // 厨余垃圾对应的舵机角度
+#define SERVO_ANGLE_OTHER      110 // 其它垃圾对应的舵机角度
+#define SERVO_ANGLE_RECYCLING  150 // 可回收垃圾对应的舵机角度
+#define SERVO_ANGLE_DEFAULT    90  // 默认位置
+
 // 垃圾类型状态变量
 int currentWasteType = -1;  // -1表示未检测到垃圾类型
 String wasteTypeStr = "未识别";  // 存储垃圾类型的字符串
@@ -200,7 +207,7 @@ void handleServo() {
     Serial.println("网页控制：舵机正转");
     myServo.write(0);  // 正转
     delay(125);
-    myServo.write(90); // 停止
+    // myServo.write(90); // 停止
     binStatusStr = "已打开";
     server.send(200, "text/plain", "垃圾桶已打开");
   } 
@@ -209,7 +216,7 @@ void handleServo() {
     Serial.println("网页控制：舵机反转");
     myServo.write(180); // 反转
     delay(125);
-    myServo.write(90);  // 停止
+    // myServo.write(90);  // 停止
     binStatusStr = "已关闭";
     server.send(200, "text/plain", "垃圾桶已关闭");
   }
@@ -261,6 +268,47 @@ String getWasteTypeString(int type) {
     default:
       return "未识别";
   }
+}
+
+// 新增函数：根据垃圾类型控制舵机转到对应角度
+void rotateServoByWasteType(int wasteType) {
+  int targetAngle = SERVO_ANGLE_DEFAULT;
+  
+  switch(wasteType) {
+    case WASTE_TYPE_HARMFUL:
+      targetAngle = SERVO_ANGLE_HARMFUL;
+      Serial.println("舵机旋转到有害垃圾位置");
+      break;
+    case WASTE_TYPE_KITCHEN:
+      targetAngle = SERVO_ANGLE_KITCHEN;
+      Serial.println("舵机旋转到厨余垃圾位置");
+      break;
+    case WASTE_TYPE_OTHER:
+      targetAngle = SERVO_ANGLE_OTHER;
+      Serial.println("舵机旋转到其它垃圾位置");
+      break;
+    case WASTE_TYPE_RECYCLING:
+      targetAngle = SERVO_ANGLE_RECYCLING;
+      Serial.println("舵机旋转到可回收垃圾位置");
+      break;
+    default:
+      targetAngle = SERVO_ANGLE_DEFAULT;
+      Serial.println("舵机旋转到默认位置");
+      break;
+  }
+  
+  // 控制舵机转到目标角度
+  myServo.write(targetAngle);
+  delay(200); // 最小等待时间，确保舵机开始移动
+  
+  // 更新垃圾桶状态显示
+  binStatusStr = "分类中: " + getWasteTypeString(wasteType);
+  
+  // 缩短等待时间到1秒
+  delay(1000);
+  myServo.write(SERVO_ANGLE_DEFAULT);
+  Serial.println("舵机回到默认位置");
+  binStatusStr = "待机中";
 }
 
 void setup() {
@@ -460,6 +508,11 @@ void loop() {
       wasteTypeStr = getWasteTypeString(currentWasteType);
       Serial.print("当前垃圾类型: ");
       Serial.println(wasteTypeStr);
+      
+      // 根据垃圾类型控制舵机旋转
+      if(currentWasteType != -1) {
+        rotateServoByWasteType(currentWasteType);
+      }
       
       // 上报数据到华为云
       reportWasteTypeToCloud(currentWasteType, wasteTypeStr);
